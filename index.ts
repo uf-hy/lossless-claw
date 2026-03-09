@@ -42,6 +42,8 @@ function normalizeAgentId(agentId: string | undefined): string {
 type PluginEnvSnapshot = {
   lcmSummaryModel: string;
   lcmSummaryProvider: string;
+  pluginSummaryModel: string;
+  pluginSummaryProvider: string;
   openclawProvider: string;
   openclawDefaultModel: string;
   agentDir: string;
@@ -62,6 +64,8 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
   return {
     lcmSummaryModel: env.LCM_SUMMARY_MODEL?.trim() ?? "",
     lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    pluginSummaryModel: "",
+    pluginSummaryProvider: "",
     openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
@@ -621,6 +625,18 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       : undefined;
   const config = resolveLcmConfig(process.env, pluginConfig);
 
+  // Read model overrides from plugin config
+  if (pluginConfig) {
+    const summaryModel = pluginConfig.summaryModel;
+    const summaryProvider = pluginConfig.summaryProvider;
+    if (typeof summaryModel === "string") {
+      envSnapshot.pluginSummaryModel = summaryModel.trim();
+    }
+    if (typeof summaryProvider === "string") {
+      envSnapshot.pluginSummaryProvider = summaryProvider.trim();
+    }
+  }
+
   return {
     config,
     complete: async ({
@@ -808,7 +824,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     },
     resolveModel: (modelRef, providerHint) => {
       const raw =
-        (modelRef?.trim() || envSnapshot.lcmSummaryModel || envSnapshot.openclawDefaultModel).trim();
+        (modelRef?.trim() || 
+         envSnapshot.pluginSummaryModel || 
+         envSnapshot.lcmSummaryModel || 
+         envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -822,6 +841,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
 
       const provider = (
+        envSnapshot.pluginSummaryProvider ||
         envSnapshot.lcmSummaryProvider ||
         providerHint?.trim() ||
         envSnapshot.openclawProvider ||

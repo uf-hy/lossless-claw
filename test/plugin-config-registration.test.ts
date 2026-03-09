@@ -142,4 +142,51 @@ describe("lcm plugin registration", () => {
       model: "claude-sonnet-4-6",
     });
   });
+
+  it("uses plugin config model override when summaryModel is set", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "gpt-5.4",
+      summaryProvider: "openai-resp",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "openai-resp",
+      model: "gpt-5.4",
+    });
+  });
+
+  it("uses plugin config model with provider/model format", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      summaryModel: "openai-resp/gpt-5.4",
+    });
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "openai-resp",
+      model: "gpt-5.4",
+    });
+  });
 });
