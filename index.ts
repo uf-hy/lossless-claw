@@ -824,9 +824,9 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     },
     resolveModel: (modelRef, providerHint) => {
       const raw =
-        (modelRef?.trim() || 
-         envSnapshot.pluginSummaryModel || 
-         envSnapshot.lcmSummaryModel || 
+        (modelRef?.trim() ||
+         envSnapshot.pluginSummaryModel ||
+         envSnapshot.lcmSummaryModel ||
          envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
@@ -841,9 +841,9 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
 
       const provider = (
+        providerHint?.trim() ||
         envSnapshot.pluginSummaryProvider ||
         envSnapshot.lcmSummaryProvider ||
-        providerHint?.trim() ||
         envSnapshot.openclawProvider ||
         "openai"
       ).trim();
