@@ -38,7 +38,8 @@ jobs:
 
       - name: Read package version
         id: package
-        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          printf 'version=%s\n' "$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Ensure release tag does not already exist
         run: |
