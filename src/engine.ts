@@ -685,6 +685,410 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
+  /** Format token counts for compact human-readable status strings. */
+  private formatTokenCountCompact(value: number | undefined): string {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      return "unknown";
+    }
+    const normalized = Math.floor(value);
+    if (normalized >= 1_000_000) {
+      const millions = normalized / 1_000_000;
+      return `${millions >= 10 ? millions.toFixed(0) : millions.toFixed(1).replace(/\.0$/, "")}m`;
+    }
+    if (normalized >= 1_000) {
+      const thousands = normalized / 1_000;
+      return `${thousands >= 10 ? thousands.toFixed(0) : thousands.toFixed(1).replace(/\.0$/, "")}k`;
+    }
+    return `${normalized}`;
+  }
+
+  private async collectCompactionDiagnostics(params: {
+    conversationId: number;
+    tokenBudget: number;
+    decisionCurrentTokens: number;
+    thresholdTokens: number;
+    targetTokens: number;
+    summarizerLabel?: string;
+    observedTokens?: number;
+    noEligibleSweepChunks?: boolean;
+  }): Promise<{
+    compactableTokens: number;
+    assembledPromptTokens: number;
+    totalContextItems: number;
+    outsideProtectedTailItems: number;
+    protectedTailTokens: number;
+    protectedTailItems: number;
+    rawTokensUntilLeafTrigger: number;
+    summarizerLabel?: string;
+    livePromptTokens?: number;
+    decisionTokens: number;
+    thresholdTokens: number;
+    targetTokens: number;
+    rawTokensOutsideFreshTail: number;
+    leafTriggerThreshold: number;
+    noEligibleSweepChunks: boolean;
+    sweepBlockerCode?: string;
+    sweepBlockerMessage?: string;
+  }> {
+    const compactableTokens = await this.summaryStore.getContextTokenCount(params.conversationId);
+    const leafTrigger = await this.compaction.evaluateLeafTrigger(params.conversationId);
+    const assembly = await this.collectAssemblyDiagnostics(params.conversationId, params.tokenBudget);
+    const sweepBlocker =
+      params.noEligibleSweepChunks === true
+        ? await this.diagnoseNoOpSweepBlocker(params.conversationId)
+        : undefined;
+    return {
+      compactableTokens,
+      assembledPromptTokens: assembly.assembledPromptTokens,
+      totalContextItems: assembly.totalContextItems,
+      outsideProtectedTailItems: assembly.outsideProtectedTailItems,
+      protectedTailTokens: assembly.protectedTailTokens,
+      protectedTailItems: assembly.protectedTailItems,
+      rawTokensUntilLeafTrigger: Math.max(0, leafTrigger.threshold - leafTrigger.rawTokensOutsideTail),
+      ...(params.summarizerLabel ? { summarizerLabel: params.summarizerLabel } : {}),
+      ...(typeof params.observedTokens === "number" ? { livePromptTokens: params.observedTokens } : {}),
+      decisionTokens: params.decisionCurrentTokens,
+      thresholdTokens: params.thresholdTokens,
+      targetTokens: params.targetTokens,
+      rawTokensOutsideFreshTail: leafTrigger.rawTokensOutsideTail,
+      leafTriggerThreshold: leafTrigger.threshold,
+      noEligibleSweepChunks: params.noEligibleSweepChunks === true,
+      ...(sweepBlocker ? { sweepBlockerCode: sweepBlocker.code, sweepBlockerMessage: sweepBlocker.message } : {}),
+    };
+  }
+
+  private buildCompactionReasonText(
+    baseReason: string,
+    diagnostics: {
+      compactableTokens: number;
+      assembledPromptTokens: number;
+      totalContextItems: number;
+      outsideProtectedTailItems: number;
+      protectedTailTokens: number;
+      protectedTailItems: number;
+      rawTokensUntilLeafTrigger: number;
+      summarizerLabel?: string;
+      livePromptTokens?: number;
+      thresholdTokens: number;
+      targetTokens: number;
+      rawTokensOutsideFreshTail: number;
+      leafTriggerThreshold: number;
+      noEligibleSweepChunks: boolean;
+      sweepBlockerCode?: string;
+      sweepBlockerMessage?: string;
+    },
+  ): string {
+    const k = this.formatTokenCountCompact.bind(this);
+    const lines: string[] = [];
+
+    const isCompacted = baseReason === "compacted";
+    const isFailure = !isCompacted && (baseReason === "could not reach target");
+
+    // Line 1: status
+    if (isCompacted) {
+      lines.push("⚙️ Compacted");
+    } else if (isFailure) {
+      lines.push("❌ Compaction failed");
+    } else {
+      lines.push("⚙️ Compaction skipped");
+    }
+
+    // Line 2: token change (only for compacted — caller adds before/after)
+    // The caller (OpenClaw core) wraps this with "Compacted (before → after)"
+    // so we don't duplicate that here. Instead we show tree info.
+
+    // Line 2: summarizer model
+    if (diagnostics.summarizerLabel) {
+      lines.push(`🧠 ${diagnostics.summarizerLabel}`);
+    }
+
+    // Line 3: tree structure / skip reason
+    if (isCompacted) {
+      lines.push(`🌿 leaf pass`);
+    } else {
+      switch (diagnostics.sweepBlockerCode) {
+        case "fresh_tail_protected":
+          lines.push(`🌿 all items in protected tail`);
+          break;
+        case "raw_chunk_not_selected":
+          lines.push(`🌿 raw msgs outside tail`);
+          break;
+        case "insufficient_summary_fanout":
+          lines.push(`🌿 fanout too small`);
+          break;
+        case "insufficient_summary_mass":
+          lines.push(`🌿 mass too small`);
+          break;
+        case "no_contiguous_summary_chunk":
+          lines.push(`🌿 no eligible chunk`);
+          break;
+        case "empty_context":
+          lines.push(`🌿 context empty`);
+          break;
+        default:
+          if (diagnostics.rawTokensOutsideFreshTail > 0 || diagnostics.leafTriggerThreshold > 0) {
+            const outsideTailText = k(diagnostics.rawTokensOutsideFreshTail);
+            const triggerText = k(diagnostics.leafTriggerThreshold);
+            lines.push(`🌿 raw ${outsideTailText} / trigger at ${triggerText}`);
+          }
+          break;
+      }
+    }
+
+    // Protected tail info
+    const protectedTailText = k(diagnostics.protectedTailTokens);
+    lines.push(`📋 protected ${protectedTailText} · ${diagnostics.protectedTailItems} items`);
+
+    // NOTE: Context usage line is appended by OpenClaw core (formatContextUsageShort),
+    // so we don't add our own to avoid duplication.
+
+    return lines.join("\n");
+  }
+
+  private resolveLeafChunkTokensForDiagnostics(): number {
+    if (
+      typeof this.config.leafChunkTokens === "number" &&
+      Number.isFinite(this.config.leafChunkTokens) &&
+      this.config.leafChunkTokens > 0
+    ) {
+      return Math.floor(this.config.leafChunkTokens);
+    }
+    return 20_000;
+  }
+
+  private resolveFreshTailCountForDiagnostics(): number {
+    if (
+      typeof this.config.freshTailCount === "number" &&
+      Number.isFinite(this.config.freshTailCount) &&
+      this.config.freshTailCount > 0
+    ) {
+      return Math.floor(this.config.freshTailCount);
+    }
+    return 8;
+  }
+
+  private async resolveContextItemTokenCount(item: {
+    itemType: string;
+    messageId: number | null;
+    summaryId: string | null;
+  }): Promise<number> {
+    if (item.itemType === "message" && item.messageId != null) {
+      const message = await this.conversationStore.getMessageById(item.messageId);
+      return message?.tokenCount ?? 0;
+    }
+    if (item.itemType === "summary" && item.summaryId != null) {
+      const summary = await this.summaryStore.getSummary(item.summaryId);
+      return summary?.tokenCount ?? 0;
+    }
+    return 0;
+  }
+
+  private async collectAssemblyDiagnostics(
+    conversationId: number,
+    tokenBudget: number,
+  ): Promise<{
+    assembledPromptTokens: number;
+    totalContextItems: number;
+    outsideProtectedTailItems: number;
+    protectedTailTokens: number;
+    protectedTailItems: number;
+  }> {
+    const freshTailCount = this.resolveFreshTailCountForDiagnostics();
+    const assembled = await this.assembler.assemble({
+      conversationId,
+      tokenBudget,
+      freshTailCount,
+    });
+    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const tailStart = Math.max(0, contextItems.length - freshTailCount);
+    const protectedTail = contextItems.slice(tailStart);
+
+    let protectedTailTokens = 0;
+    for (const item of protectedTail) {
+      protectedTailTokens += await this.resolveContextItemTokenCount(item);
+    }
+
+    return {
+      assembledPromptTokens: assembled.estimatedTokens,
+      totalContextItems: contextItems.length,
+      outsideProtectedTailItems: tailStart,
+      protectedTailTokens,
+      protectedTailItems: protectedTail.length,
+    };
+  }
+
+  private resolveFreshTailOrdinalFromContextItems(
+    contextItems: Array<{ ordinal: number; itemType: string; messageId: number | null }>,
+  ): number {
+    const freshTailCount =
+      typeof this.config.freshTailCount === "number" &&
+      Number.isFinite(this.config.freshTailCount) &&
+      this.config.freshTailCount > 0
+        ? Math.floor(this.config.freshTailCount)
+        : 0;
+    if (freshTailCount <= 0) {
+      return Infinity;
+    }
+
+    const rawMessageItems = contextItems.filter(
+      (item) => item.itemType === "message" && item.messageId != null,
+    );
+    if (rawMessageItems.length === 0) {
+      return Infinity;
+    }
+
+    const tailStartIdx = Math.max(0, rawMessageItems.length - freshTailCount);
+    return rawMessageItems[tailStartIdx]?.ordinal ?? Infinity;
+  }
+
+  private resolveFanoutForDepthForDiagnostics(targetDepth: number): number {
+    if (targetDepth === 0) {
+      if (
+        typeof this.config.leafMinFanout === "number" &&
+        Number.isFinite(this.config.leafMinFanout) &&
+        this.config.leafMinFanout > 0
+      ) {
+        return Math.floor(this.config.leafMinFanout);
+      }
+      return 8;
+    }
+    if (
+      typeof this.config.condensedMinFanout === "number" &&
+      Number.isFinite(this.config.condensedMinFanout) &&
+      this.config.condensedMinFanout > 0
+    ) {
+      return Math.floor(this.config.condensedMinFanout);
+    }
+    return 4;
+  }
+
+  private resolveCondensedMinChunkTokensForDiagnostics(): number {
+    const chunkTarget = this.resolveLeafChunkTokensForDiagnostics();
+    const ratioFloor = Math.floor(chunkTarget * 0.1);
+    const configuredTarget =
+      typeof this.config.condensedTargetTokens === "number" &&
+      Number.isFinite(this.config.condensedTargetTokens) &&
+      this.config.condensedTargetTokens > 0
+        ? Math.floor(this.config.condensedTargetTokens)
+        : 0;
+    return Math.max(configuredTarget, ratioFloor);
+  }
+
+  private async getOldestSummaryChunkAtDepthForDiagnostics(params: {
+    conversationId: number;
+    targetDepth: number;
+    freshTailOrdinal: number;
+  }): Promise<{ count: number; summaryTokens: number }> {
+    const contextItems = await this.summaryStore.getContextItems(params.conversationId);
+    const chunkTokenBudget = this.resolveLeafChunkTokensForDiagnostics();
+
+    let count = 0;
+    let summaryTokens = 0;
+    for (const item of contextItems) {
+      if (item.ordinal >= params.freshTailOrdinal) {
+        break;
+      }
+      if (item.itemType !== "summary" || item.summaryId == null) {
+        if (count > 0) {
+          break;
+        }
+        continue;
+      }
+
+      const summary = await this.summaryStore.getSummary(item.summaryId);
+      if (!summary) {
+        if (count > 0) {
+          break;
+        }
+        continue;
+      }
+      if (summary.depth !== params.targetDepth) {
+        if (count > 0) {
+          break;
+        }
+        continue;
+      }
+
+      const tokenCount =
+        typeof summary.tokenCount === "number" && Number.isFinite(summary.tokenCount) && summary.tokenCount > 0
+          ? Math.floor(summary.tokenCount)
+          : estimateTokens(summary.content);
+
+      if (count > 0 && summaryTokens + tokenCount > chunkTokenBudget) {
+        break;
+      }
+
+      count += 1;
+      summaryTokens += tokenCount;
+      if (summaryTokens >= chunkTokenBudget) {
+        break;
+      }
+    }
+
+    return { count, summaryTokens };
+  }
+
+  private async diagnoseNoOpSweepBlocker(conversationId: number): Promise<
+    | {
+        code: string;
+        message: string;
+      }
+    | undefined
+  > {
+    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    if (contextItems.length === 0) {
+      return { code: "empty_context", message: "empty context items" };
+    }
+
+    const freshTailOrdinal = this.resolveFreshTailOrdinalFromContextItems(contextItems);
+    const rawMessagesOutsideTail = contextItems.filter(
+      (item) => item.ordinal < freshTailOrdinal && item.itemType === "message" && item.messageId != null,
+    ).length;
+    if (rawMessagesOutsideTail > 0) {
+      return {
+        code: "raw_chunk_not_selected",
+        message: `raw messages outside fresh tail still present (${rawMessagesOutsideTail})`,
+      };
+    }
+
+    const depthLevels = await this.summaryStore.getDistinctDepthsInContext(conversationId, {
+      maxOrdinalExclusive: freshTailOrdinal,
+    });
+    if (depthLevels.length === 0) {
+      return {
+        code: "fresh_tail_protected",
+        message: "fresh tail protects all raw messages and no summary depth is eligible yet",
+      };
+    }
+
+    const minChunkTokens = this.resolveCondensedMinChunkTokensForDiagnostics();
+    for (const targetDepth of depthLevels) {
+      const fanout = this.resolveFanoutForDepthForDiagnostics(targetDepth);
+      const chunk = await this.getOldestSummaryChunkAtDepthForDiagnostics({
+        conversationId,
+        targetDepth,
+        freshTailOrdinal,
+      });
+      if (chunk.count < fanout) {
+        return {
+          code: "insufficient_summary_fanout",
+          message: `summary fanout ${chunk.count}/${fanout} at depth ${targetDepth} is too small`,
+        };
+      }
+      if (chunk.summaryTokens < minChunkTokens) {
+        return {
+          code: "insufficient_summary_mass",
+          message: `summary chunk ${this.formatTokenCountCompact(chunk.summaryTokens)}/${this.formatTokenCountCompact(minChunkTokens)} at depth ${targetDepth} is too small`,
+        };
+      }
+    }
+
+    return {
+      code: "no_contiguous_summary_chunk",
+      message: "no contiguous summary chunk outside protected tail is eligible",
+    };
+  }
+
   /** Resolve token budget from direct params or legacy fallback input. */
   private resolveTokenBudget(params: {
     tokenBudget?: number;
@@ -727,6 +1131,50 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       return undefined;
     }
+  }
+
+  private resolveSummarizerLabel(legacyParams?: Record<string, unknown>): string | undefined {
+    const lp = legacyParams ?? {};
+    const runtimeConfig =
+      lp.config && typeof lp.config === "object"
+        ? (lp.config as {
+            summaryModel?: unknown;
+            plugins?: {
+              entries?: {
+                [key: string]: {
+                  config?: { summaryModel?: unknown };
+                };
+              };
+            };
+          })
+        : undefined;
+    const nestedPluginSummaryModel =
+      typeof runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config?.summaryModel ===
+      "string"
+        ? runtimeConfig.plugins.entries["lossless-claw"].config.summaryModel.trim()
+        : "";
+    const summaryModelOverride =
+      (typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "") ||
+      nestedPluginSummaryModel;
+    const providerHint = typeof lp.provider === "string" ? lp.provider.trim() : "";
+    const modelHint = typeof lp.model === "string" ? lp.model.trim() : "";
+    const modelRef = summaryModelOverride || modelHint || undefined;
+    const resolveProviderHint = summaryModelOverride ? undefined : providerHint || undefined;
+    try {
+      const resolved = this.deps.resolveModel(modelRef, resolveProviderHint);
+      if (resolved.provider && resolved.model) {
+        return `${resolved.provider}/${resolved.model}`;
+      }
+    } catch {
+      // ignore and fall through to raw hints
+    }
+    if (summaryModelOverride) {
+      return summaryModelOverride;
+    }
+    if (providerHint && modelHint) {
+      return `${providerHint}/${modelHint}`;
+    }
+    return undefined;
   }
 
   /** Build a summarize callback with runtime provider fallback handling. */
@@ -1139,8 +1587,7 @@ export class LcmContextEngine implements ContextEngine {
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
     const conversationId = conversation.conversationId;
-
-    let messageForParts = message;
+    let messageForParts: AgentMessage = message;
     if (stored.role === "user") {
       const intercepted = await this.interceptLargeFiles({
         conversationId,
@@ -1410,6 +1857,7 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<CompactResult> {
     this.ensureMigrated();
     return this.withSessionQueue(params.sessionId, async () => {
+      const sessionId = params.sessionId;
       const conversation = await this.conversationStore.getConversationBySessionId(
         params.sessionId,
       );
@@ -1443,6 +1891,7 @@ export class LcmContextEngine implements ContextEngine {
         legacyParams: params.legacyParams,
         customInstructions: params.customInstructions,
       });
+      const summarizerLabel = this.resolveSummarizerLabel(params.legacyParams);
 
       const leafResult = await this.compaction.compactLeaf({
         conversationId: conversation.conversationId,
@@ -1451,12 +1900,30 @@ export class LcmContextEngine implements ContextEngine {
         force: params.force,
         previousSummaryContent: params.previousSummaryContent,
       });
+      const thresholdTokens = Math.floor(this.config.contextThreshold * tokenBudget);
+      const diagnostics = await this.collectCompactionDiagnostics({
+        conversationId: conversation.conversationId,
+        tokenBudget,
+        decisionCurrentTokens: observedTokens ?? leafResult.tokensBefore,
+        thresholdTokens,
+        targetTokens: thresholdTokens,
+        summarizerLabel,
+        observedTokens,
+      });
       const tokensBefore = observedTokens ?? leafResult.tokensBefore;
+
+      if (leafResult.actionTaken) {
+        this.deps.log.info(
+          `[lcm] compact success session=${sessionId} mode=leaf summarizer=${summarizerLabel ?? "unknown"} before=${tokensBefore} after=${leafResult.tokensAfter} assembled=${diagnostics.assembledPromptTokens} protected_tail=${diagnostics.protectedTailTokens}/${diagnostics.protectedTailItems}`,
+        );
+      }
 
       return {
         ok: true,
         compacted: leafResult.actionTaken,
-        reason: leafResult.actionTaken ? "compacted" : "below threshold",
+        reason: leafResult.actionTaken
+          ? this.buildCompactionReasonText("compacted", diagnostics)
+          : this.buildCompactionReasonText("below threshold", diagnostics),
         result: {
           tokensBefore,
           tokensAfter: leafResult.tokensAfter,
@@ -1464,6 +1931,7 @@ export class LcmContextEngine implements ContextEngine {
             rounds: leafResult.actionTaken ? 1 : 0,
             targetTokens: tokenBudget,
             mode: "leaf",
+            diagnostics,
           },
         },
       };
@@ -1518,6 +1986,7 @@ export class LcmContextEngine implements ContextEngine {
         legacyParams: params.legacyParams,
         customInstructions: params.customInstructions,
       });
+      const summarizerLabel = this.resolveSummarizerLabel(params.legacyParams);
 
       // Evaluate whether compaction is needed (unless forced)
       const observedTokens = this.normalizeObservedTokenCount(
@@ -1538,12 +2007,25 @@ export class LcmContextEngine implements ContextEngine {
         observedTokens !== undefined && observedTokens >= targetTokens;
 
       if (!forceCompaction && !decision.shouldCompact) {
+        const diagnostics = await this.collectCompactionDiagnostics({
+          conversationId,
+          tokenBudget,
+          decisionCurrentTokens: decision.currentTokens,
+          thresholdTokens: decision.threshold,
+          targetTokens,
+          summarizerLabel,
+          observedTokens,
+        });
         return {
           ok: true,
           compacted: false,
-          reason: "below threshold",
+          reason: this.buildCompactionReasonText("below threshold", diagnostics),
           result: {
             tokensBefore: decision.currentTokens,
+            details: {
+              targetTokens,
+              diagnostics,
+            },
           },
         };
       }
@@ -1558,23 +2040,41 @@ export class LcmContextEngine implements ContextEngine {
           force: forceCompaction,
           hardTrigger: false,
         });
+        const diagnostics = await this.collectCompactionDiagnostics({
+          conversationId,
+          tokenBudget,
+          decisionCurrentTokens: decision.currentTokens,
+          thresholdTokens: decision.threshold,
+          targetTokens,
+          summarizerLabel,
+          observedTokens,
+          noEligibleSweepChunks: !sweepResult.actionTaken,
+        });
+        const skipReason = manualCompactionRequested
+          ? "nothing to compact"
+          : liveContextStillExceedsTarget
+            ? "live context still exceeds target"
+            : "already under target";
+
+        if (sweepResult.actionTaken) {
+          this.deps.log.info(
+            `[lcm] compact success session=${sessionId} mode=sweep summarizer=${summarizerLabel ?? "unknown"} before=${decision.currentTokens} after=${sweepResult.tokensAfter} assembled=${diagnostics.assembledPromptTokens} protected_tail=${diagnostics.protectedTailTokens}/${diagnostics.protectedTailItems}`,
+          );
+        }
 
         return {
           ok: sweepResult.actionTaken || !liveContextStillExceedsTarget,
           compacted: sweepResult.actionTaken,
           reason: sweepResult.actionTaken
-            ? "compacted"
-            : manualCompactionRequested
-              ? "nothing to compact"
-              : liveContextStillExceedsTarget
-                ? "live context still exceeds target"
-                : "already under target",
+            ? this.buildCompactionReasonText("compacted", diagnostics)
+            : this.buildCompactionReasonText(skipReason, diagnostics),
           result: {
             tokensBefore: decision.currentTokens,
             tokensAfter: sweepResult.tokensAfter,
             details: {
               rounds: sweepResult.actionTaken ? 1 : 0,
               targetTokens,
+              diagnostics,
             },
           },
         };
@@ -1596,24 +2096,96 @@ export class LcmContextEngine implements ContextEngine {
       });
       const didCompact = compactResult.rounds > 0;
 
+      const diagnostics = await this.collectCompactionDiagnostics({
+        conversationId,
+        tokenBudget,
+        decisionCurrentTokens: decision.currentTokens,
+        thresholdTokens: decision.threshold,
+        targetTokens: convergenceTargetTokens,
+        summarizerLabel,
+        observedTokens,
+        noEligibleSweepChunks: !didCompact,
+      });
+
+      if (compactResult.success && didCompact) {
+        this.deps.log.info(
+          `[lcm] compact success session=${sessionId} mode=converge summarizer=${summarizerLabel ?? "unknown"} before=${decision.currentTokens} after=${compactResult.finalTokens} assembled=${diagnostics.assembledPromptTokens} protected_tail=${diagnostics.protectedTailTokens}/${diagnostics.protectedTailItems}`,
+        );
+      }
+
       return {
         ok: compactResult.success,
         compacted: didCompact,
         reason: compactResult.success
           ? didCompact
-            ? "compacted"
-            : "already under target"
-          : "could not reach target",
+            ? this.buildCompactionReasonText("compacted", diagnostics)
+            : this.buildCompactionReasonText("already under target", diagnostics)
+          : this.buildCompactionReasonText("could not reach target", diagnostics),
         result: {
           tokensBefore: decision.currentTokens,
           tokensAfter: compactResult.finalTokens,
           details: {
             rounds: compactResult.rounds,
             targetTokens: convergenceTargetTokens,
+            diagnostics,
           },
         },
       };
     });
+  }
+
+  /**
+   * Return tree status for a specific conversation.
+   * Used by the /lcm plugin command.
+   */
+  async getTreeStatus(conversationId: number): Promise<{
+    contextItems: { type: string; count: number }[];
+    depthStats: { depth: number; count: number; totalTokens: number; totalDescendants: number; totalDescTokens: number }[];
+    totalMessages: number;
+    recentSummaries: { kind: string; depth: number; tokenCount: number; sourceTokenCount: number; createdAt: string }[];
+  }> {
+    const { DatabaseSync } = await import("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(this.config.databasePath, { readonly: true });
+
+    try {
+      const contextItems = db
+        .prepare(
+          "SELECT item_type as type, COUNT(*) as count FROM context_items WHERE conversation_id = ? GROUP BY item_type",
+        )
+        .all(conversationId) as { type: string; count: number }[];
+
+      const depthStats = db
+        .prepare(
+          `SELECT depth, COUNT(*) as count, SUM(token_count) as totalTokens,
+                  SUM(descendant_count) as totalDescendants,
+                  SUM(descendant_token_count) as totalDescTokens
+           FROM summaries WHERE conversation_id = ?
+           GROUP BY depth ORDER BY depth`,
+        )
+        .all(conversationId) as { depth: number; count: number; totalTokens: number; totalDescendants: number; totalDescTokens: number }[];
+
+      const totalRow = db
+        .prepare("SELECT COUNT(*) as totalMessages FROM messages WHERE conversation_id = ?")
+        .get(conversationId) as { totalMessages: number } | undefined;
+
+      const recentSummaries = db
+        .prepare(
+          `SELECT kind, depth, token_count as tokenCount,
+                  source_message_token_count as sourceTokenCount, created_at as createdAt
+           FROM summaries WHERE conversation_id = ?
+           ORDER BY created_at DESC LIMIT 5`,
+        )
+        .all(conversationId) as { kind: string; depth: number; tokenCount: number; sourceTokenCount: number; createdAt: string }[];
+
+      return {
+        contextItems,
+        depthStats,
+        totalMessages: totalRow?.totalMessages ?? 0,
+        recentSummaries,
+      };
+    } finally {
+      db.close();
+    }
   }
 
   async prepareSubagentSpawn(params: {
