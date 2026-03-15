@@ -1316,6 +1316,143 @@ const lcmPlugin = {
       }),
     );
 
+    // ── /lcm slash command ──────────────────────────────────────
+    api.registerCommand({
+      name: "lcm",
+      description: "Show LCM tree status: leaf counts per level, context usage, recent compaction history",
+      acceptsArgs: false,
+      async handler(ctx) {
+        try {
+          const accountId = (ctx as Record<string, unknown>).accountId as string | undefined;
+          if (!accountId) {
+            return { text: "⚠️ Cannot determine agent account." };
+          }
+
+          // ── Step 1: Find the most recently active session UUID via file mtime ──
+          // Mirrors humanize-output's approach: scan session JSONL files,
+          // use filesystem mtime as the ground truth for "which session is active".
+          const { readdirSync, statSync, existsSync } = await import("node:fs");
+          const { join } = await import("node:path");
+          const { homedir } = await import("node:os");
+
+          const sessionsDir = join(homedir(), ".openclaw", "agents", accountId, "sessions");
+          if (!existsSync(sessionsDir)) {
+            return { text: `⚠️ No sessions directory found: ${sessionsDir}` };
+          }
+
+          interface SessionCandidate {
+            uuid: string;
+            mtimeMs: number;
+            filePath: string;
+          }
+
+          const candidates: SessionCandidate[] = [];
+          for (const f of readdirSync(sessionsDir)) {
+            if (!f.endsWith(".jsonl") || f.includes(".lock") || f.includes(".reset.")) continue;
+            const filePath = join(sessionsDir, f);
+            try {
+              const st = statSync(filePath);
+              candidates.push({ uuid: f.replace(/\.jsonl$/, ""), mtimeMs: st.mtimeMs, filePath });
+            } catch {}
+          }
+
+          if (candidates.length === 0) {
+            return { text: "⚠️ No session files found." };
+          }
+
+          // Sort by most recent mtime
+          candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+          // ── Step 2: Find matching LCM conversation ──
+          const { DatabaseSync } = await import("node:sqlite") as typeof import("node:sqlite");
+          const db = new DatabaseSync(deps.config.databasePath, { readonly: true });
+
+          let conversationId: number | undefined;
+          let matchedUuid: string | undefined;
+
+          try {
+            // Try candidates in order of recency until we find one with LCM data
+            for (const c of candidates) {
+              const row = db
+                .prepare(
+                  "SELECT conversation_id FROM conversations WHERE session_id = ? LIMIT 1",
+                )
+                .get(c.uuid) as { conversation_id: number } | undefined;
+              if (row) {
+                conversationId = row.conversation_id;
+                matchedUuid = c.uuid;
+                break;
+              }
+            }
+          } finally {
+            db.close();
+          }
+
+          if (!conversationId) {
+            return {
+              text: `⚠️ None of ${candidates.length} session files matched an LCM conversation.`,
+            };
+          }
+
+          // ── Step 3: Query tree status ──
+          const status = await lcm.getTreeStatus(conversationId);
+
+          // Format helper
+          const fmt = (n: number | undefined | null): string => {
+            if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "?";
+            if (n >= 1_000_000)
+              return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+            if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+            return `${n}`;
+          };
+
+          const msgItems = status.contextItems.find((i) => i.type === "message")?.count ?? 0;
+          const sumItems = status.contextItems.find((i) => i.type === "summary")?.count ?? 0;
+
+          const assembledTokens = status.depthStats.reduce((s, d) => s + d.totalTokens, 0);
+          const expandedTokens = status.depthStats.reduce(
+            (s, d) => s + (d.totalDescTokens || d.totalTokens),
+            0,
+          );
+
+          const lines: string[] = [];
+          lines.push("🌳 LCM Tree Status");
+          lines.push(`📊 assembled ${fmt(assembledTokens)} · expanded ${fmt(expandedTokens)}`);
+          lines.push(`📋 ${msgItems} msgs + ${sumItems} summaries · ${status.totalMessages} total`);
+          lines.push("");
+
+          if (status.depthStats.length > 0) {
+            lines.push("🌿 Tree:");
+            for (const d of status.depthStats) {
+              const label = d.depth === 0 ? "L0 (leaf)" : `L${d.depth} (condensed)`;
+              lines.push(
+                `   ${label}: ${d.count} nodes · ${fmt(d.totalTokens)}` +
+                  (d.totalDescendants > 0 ? ` · ${fmt(d.totalDescTokens)} expanded` : ""),
+              );
+            }
+            lines.push("");
+          }
+
+          if (status.recentSummaries.length > 0) {
+            lines.push("📜 Recent:");
+            for (const s of status.recentSummaries) {
+              const time = s.createdAt?.slice(11, 16) ?? "??";
+              const label = s.kind === "leaf" ? "leaf" : `L${s.depth}`;
+              lines.push(
+                `   ${time} ${label} · ${fmt(s.sourceTokenCount)} → ${fmt(s.tokenCount)}`,
+              );
+            }
+          }
+
+          return { text: lines.join("\n") };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          deps.log.error(`[lcm] /lcm command failed: ${msg}`);
+          return { text: `⚠️ Failed to query LCM status: ${msg}` };
+        }
+      },
+    });
+
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
     );
