@@ -19,6 +19,10 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
+  /** Model override for conversation summarization. */
+  summaryModel: string;
+  /** Provider override for conversation summarization. */
+  summaryProvider: string;
   autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
@@ -114,6 +118,10 @@ export function resolveLcmConfig(
       env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? toStr(pc.largeFileSummaryProvider) ?? "",
     largeFileSummaryModel:
       env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? toStr(pc.largeFileSummaryModel) ?? "",
+    summaryModel:
+      env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
+    summaryProvider:
+      env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
     autocompactDisabled:
       env.LCM_AUTOCOMPACT_DISABLED !== undefined
         ? env.LCM_AUTOCOMPACT_DISABLED === "true"
