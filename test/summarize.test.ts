@@ -164,8 +164,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     );
   });
 
-  it("summaryModel without provider and no slash emits warning and falls back to legacy", async () => {
-    // Under same-level pairing: model without provider and no embedded prefix => warn + skip.
+  it("summaryModel without provider and no slash emits warning but still resolves", async () => {
+    // model without same-level provider and no embedded prefix => warn but allow resolution without provider
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const deps = makeDeps();
 
@@ -180,9 +180,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       },
     });
 
-    // Should fall back to legacy model+provider since the config level was skipped
-    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
-    // Warning must mention the skipped model name
+    // Should attempt resolution with the configured model and no provider hint
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", undefined);
+    // Warning must still mention the model name
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
     warnSpy.mockRestore();
   });

@@ -659,11 +659,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
   const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
 
-  // Same-level model+provider pairing: model and provider must come from the same config level.
-  // If a level has a model but no same-level provider and the model contains no '/' (embedded
-  // provider prefix), that level is skipped with a warning instead of silently mixing providers
-  // across levels.
-  const _summaryLevels = [
+  // Resolve summary model/provider from highest-priority config level first.
+  // model+provider must come from the same level to avoid cross-level mixing.
+  const summaryLevels = [
     {
       levelName: "plugin config (lossless-claw)",
       model: typeof nestedPluginConfig?.summaryModel === "string" ? nestedPluginConfig.summaryModel.trim() : "",
@@ -676,34 +674,33 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     },
   ];
 
-  let _resolvedSummary: { model: string; provider: string | undefined } | undefined;
-  for (const _level of _summaryLevels) {
-    if (!_level.model) continue; // no model at this level, skip silently
-    if (_level.model.includes("/")) {
-      // provider is embedded in model string (e.g. "openai-resp/gpt-5.1")
-      _resolvedSummary = { model: _level.model, provider: undefined };
+  let resolvedSummary: { model: string; provider: string | undefined } | undefined;
+  for (const level of summaryLevels) {
+    if (!level.model) continue;
+    if (level.model.includes("/")) {
+      resolvedSummary = { model: level.model, provider: undefined };
       break;
     }
-    if (_level.provider) {
-      // same-level provider present, pair them
-      _resolvedSummary = { model: _level.model, provider: _level.provider };
+    if (level.provider) {
+      resolvedSummary = { model: level.model, provider: level.provider };
       break;
     }
-    // model exists but no same-level provider and no embedded provider prefix — warn and skip
     console.warn(
-      `[lcm] summaryModel "${_level.model}" set at level "${_level.levelName}" has no same-level summaryProvider and no provider prefix in model string. Skipping this level.`
+      `[lcm] summaryModel "${level.model}" at "${level.levelName}" has no summaryProvider or provider prefix. Will attempt resolution without provider.`
     );
+    resolvedSummary = { model: level.model, provider: undefined };
+    break;
   }
 
   const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
-  const modelRef = _resolvedSummary?.model || modelHint || undefined;
+  const modelRef = resolvedSummary?.model || modelHint || undefined;
 
   const resolveProviderHint =
-    _resolvedSummary !== undefined
-      ? _resolvedSummary.provider
+    resolvedSummary !== undefined
+      ? resolvedSummary.provider
       : (providerHint || undefined);
 
   let resolved: { provider: string; model: string };
