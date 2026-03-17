@@ -1372,6 +1372,122 @@ describe("LcmContextEngine fidelity and token budget", () => {
       }),
     );
   });
+
+  it("afterTurn accepts runtimeContext and forwards it as legacyParams", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-runtime-context";
+    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5" };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+      threshold: 20_000,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-context"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      runtimeContext,
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalled();
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+    expect(compactSpy).toHaveBeenCalled();
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+  });
+
+  it("afterTurn falls back to legacyCompactionParams when runtimeContext is missing", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-legacy-compaction-params";
+    const legacyCompactionParams = { provider: "anthropic", model: "claude-opus-4-5" };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+      threshold: 20_000,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-legacy-compaction-params"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      legacyCompactionParams,
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalled();
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      legacyCompactionParams,
+    );
+    expect(compactSpy).toHaveBeenCalled();
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      legacyCompactionParams,
+    );
+  });
+
+  it("afterTurn prefers runtimeContext when both runtimeContext and legacyCompactionParams are set", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-runtime-context-priority";
+    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", source: "rt" };
+    const legacyCompactionParams = {
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      source: "legacy",
+    };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-context-priority"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      runtimeContext,
+      legacyCompactionParams,
+    });
+
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+  });
 });
 
 // ── Compact token budget plumbing ───────────────────────────────────────────
@@ -1398,6 +1514,153 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.ok).toBe(false);
     expect(result.compacted).toBe(false);
     expect(result.reason).toContain("missing token budget");
+  });
+
+  it("reads tokenBudget and currentTokenCount from runtimeContext", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 500,
+      threshold: 300,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 500,
+        tokensAfter: 280,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "runtime-context-token-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "runtime-context-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      runtimeContext: {
+        tokenBudget: 400,
+        currentTokenCount: 500,
+      },
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 400,
+        summarize: expect.any(Function),
+        force: false,
+        hardTrigger: false,
+      }),
+    );
+  });
+
+  it("forces one compaction round for manual compaction requests in runtimeContext", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 116_000,
+      threshold: 150_000,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 116_000,
+        tokensAfter: 92_000,
+        condensed: false,
+      });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "manual-compact-runtime-context",
+      message: { role: "user", content: "trigger manual compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "manual-compact-runtime-context",
+      sessionFile: "/tmp/session.jsonl",
+      runtimeContext: {
+        tokenBudget: 200_000,
+        manualCompaction: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 200_000,
+        summarize: expect.any(Function),
+        force: true,
+        hardTrigger: false,
+      }),
+    );
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
+  });
+
+  it("prefers runtimeContext over legacyParams when both are provided", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 12,
+      threshold: 9,
+    });
+    const compactSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "runtime-context-priority-session",
+      message: makeMessage({ role: "user", content: "hello world" }),
+    });
+
+    const result = await engine.compact({
+      sessionId: "runtime-context-priority-session",
+      sessionFile: "/tmp/unused.jsonl",
+      runtimeContext: { tokenBudget: 123 },
+      legacyParams: { tokenBudget: 999 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123);
+    expect(compactSpy).not.toHaveBeenCalled();
   });
 
   it("accepts explicit token budget without falling back to defaults", async () => {
