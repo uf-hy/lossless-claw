@@ -77,7 +77,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("prefers summaryProvider from runtime config when present", async () => {
+  it("summaryProvider alone (no summaryModel) is ignored and falls back to legacy provider", async () => {
+    // Under the same-level pairing rule, a level with no model is skipped silently.
+    // Setting only summaryProvider without summaryModel has no effect.
     const deps = makeDeps();
 
     await createLcmSummarizeFromLegacyParams({
@@ -91,11 +93,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(
       "claude-opus-4-5",
-      "openai-resp",
+      "anthropic",
     );
   });
 
-  it("prefers plugin summaryProvider over top-level config", async () => {
+  it("plugin-level model+provider pair takes priority over top-level pair", async () => {
+    // Both levels are complete (model+provider); plugin level wins.
     const deps = makeDeps();
 
     await createLcmSummarizeFromLegacyParams({
@@ -104,17 +107,18 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         provider: "anthropic",
         model: "claude-opus-4-5",
         config: {
+          summaryModel: "gpt-4o-mini",
           summaryProvider: "openai-resp",
           plugins: {
             entries: {
-              "lossless-claw": { config: { summaryProvider: "qiniu" } },
+              "lossless-claw": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
             },
           },
         },
       },
     });
 
-    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "qiniu");
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4.1", "qiniu");
   });
 
   it("prefers plugin summaryModel over top-level config", async () => {
@@ -160,7 +164,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     );
   });
 
-  it("omits providerHint when only summaryModel override exists", async () => {
+  it("summaryModel without provider and no slash emits warning and falls back to legacy", async () => {
+    // Under same-level pairing: model without provider and no embedded prefix => warn + skip.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const deps = makeDeps();
 
     await createLcmSummarizeFromLegacyParams({
@@ -174,7 +180,11 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       },
     });
 
-    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", undefined);
+    // Should fall back to legacy model+provider since the config level was skipped
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
+    // Warning must mention the skipped model name
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
+    warnSpy.mockRestore();
   });
 
   it("falls back to legacy providerHint when no summary overrides exist", async () => {
