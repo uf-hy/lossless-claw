@@ -642,11 +642,24 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
 }): Promise<LcmSummarizeFn | undefined> {
+  const readModelRef = (value: unknown): string => {
+    if (typeof value === "string") {
+      return value.trim();
+    }
+    const primary = (value as { primary?: unknown } | undefined)?.primary;
+    return typeof primary === "string" ? primary.trim() : "";
+  };
+
   const runtimeConfig =
     params.legacyParams.config && typeof params.legacyParams.config === "object"
       ? (params.legacyParams.config as {
-          summaryModel?: unknown;
-          summaryProvider?: unknown;
+          agents?: {
+            defaults?: {
+              compaction?: {
+                model?: unknown;
+              };
+            };
+          };
           plugins?: {
             entries?: {
               [key: string]: {
@@ -659,18 +672,21 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
   const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
 
-  // Resolve summary model/provider from highest-priority config level first.
-  // model+provider must come from the same level to avoid cross-level mixing.
   const summaryLevels = [
     {
       levelName: "plugin config (lossless-claw)",
-      model: typeof nestedPluginConfig?.summaryModel === "string" ? nestedPluginConfig.summaryModel.trim() : "",
+      model: readModelRef(nestedPluginConfig?.summaryModel),
       provider: typeof nestedPluginConfig?.summaryProvider === "string" ? nestedPluginConfig.summaryProvider.trim() : "",
     },
     {
-      levelName: "top-level runtimeConfig",
-      model: typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "",
-      provider: typeof runtimeConfig?.summaryProvider === "string" ? runtimeConfig.summaryProvider.trim() : "",
+      levelName: "environment variables",
+      model: process.env.LCM_SUMMARY_MODEL?.trim() ?? "",
+      provider: process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    },
+    {
+      levelName: "OpenClaw agents.defaults.compaction.model",
+      model: readModelRef(runtimeConfig?.agents?.defaults?.compaction?.model),
+      provider: "",
     },
   ];
 
@@ -685,7 +701,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       resolvedSummary = { model: level.model, provider: level.provider };
       break;
     }
-    console.warn(
+    params.deps.log.warn(
       `[lcm] summaryModel "${level.model}" at "${level.levelName}" has no summaryProvider or provider prefix. Will attempt resolution without provider.`
     );
     resolvedSummary = { model: level.model, provider: undefined };
