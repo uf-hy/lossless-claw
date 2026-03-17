@@ -61,8 +61,8 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    getApiKey: vi.fn(() => process.env.ANTHROPIC_API_KEY),
-    requireApiKey: vi.fn(() => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
+    getApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY),
+    requireApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
@@ -1092,6 +1092,169 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect((assembledMessage.content as Array<{ type?: string }>)[0]?.type).toBe("tool_result");
   });
 
+  it("preserves toolName through ingest-assemble round-trip for Gemini compatibility", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_456", name: "bash", input: { command: "ls" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_456",
+        toolName: "bash",
+        content: [{ type: "text", text: "file1.txt\nfile2.txt" }],
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].toolName).toBe("bash");
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_456");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+  });
+
+  it("preserves toolResult error state through ingest-assemble round-trip", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_457", name: "bash", input: { command: "false" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_457",
+        toolName: "bash",
+        content: [{ type: "text", text: "command failed" }],
+        isError: true,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({ isError: true });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_457");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(true);
+  });
+
+  it("preserves top-level tool metadata for string-content tool results", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_458", name: "bash", input: { command: "pwd" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_458",
+        toolName: "bash",
+        content: "/tmp/project",
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].partType).toBe("text");
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({
+      toolCallId: "call_458",
+      toolName: "bash",
+      isError: false,
+    });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+      content?: unknown;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_458");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+    expect(result.content).toEqual([{ type: "text", text: "/tmp/project" }]);
+  });
+
   it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
@@ -1885,5 +2048,58 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(false);
     expect(result.reason).toBe("already under target");
+  });
+
+  it("reports live overflow when a forced sweep cannot compact stored context", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 277_403,
+      threshold: 150_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 17_561,
+      tokensAfter: 17_561,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "forced-sweep-live-overflow",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "forced-sweep-live-overflow",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      currentTokenCount: 277_403,
+      force: true,
+      compactionTarget: "budget",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("live context still exceeds target");
+    expect(result.result?.tokensBefore).toBe(277_403);
+    expect(result.result?.tokensAfter).toBe(17_561);
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        rounds: 0,
+        targetTokens: 200_000,
+      }),
+    );
   });
 });

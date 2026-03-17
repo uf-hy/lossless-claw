@@ -34,8 +34,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       provider: "anthropic",
       model: "claude-opus-4-5",
     })),
-    getApiKey: vi.fn(() => "test-api-key"),
-    requireApiKey: vi.fn(() => "test-api-key"),
+    getApiKey: vi.fn(async () => "test-api-key"),
+    requireApiKey: vi.fn(async () => "test-api-key"),
     parseAgentSessionKey: vi.fn(() => null),
     isSubagentSessionKey: vi.fn(() => false),
     normalizeAgentId: vi.fn(() => "main"),
@@ -296,7 +296,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
   it("passes resolved API key to completion calls", async () => {
     const deps = makeDeps({
-      getApiKey: vi.fn(() => "resolved-api-key"),
+      getApiKey: vi.fn(async () => "resolved-api-key"),
     });
 
     const summarize = await createLcmSummarizeFromLegacyParams({

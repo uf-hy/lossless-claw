@@ -66,6 +66,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function safeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 function appendTextValue(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
@@ -270,6 +274,12 @@ function buildMessageParts(params: {
     safeString(topLevel.tool_use_id) ??
     safeString(topLevel.call_id) ??
     safeString(topLevel.id);
+  const topLevelToolName =
+    safeString(topLevel.toolName) ??
+    safeString(topLevel.tool_name);
+  const topLevelIsError =
+    safeBoolean(topLevel.isError) ??
+    safeBoolean(topLevel.is_error);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -313,6 +323,9 @@ function buildMessageParts(params: {
         textContent: message.content,
         metadata: toJson({
           originalRole: role,
+          toolCallId: topLevelToolCallId,
+          toolName: topLevelToolName,
+          isError: topLevelIsError,
         }),
       },
     ];
@@ -357,7 +370,8 @@ function buildMessageParts(params: {
       toolName:
         safeString(metadataRecord?.name) ??
         safeString(metadataRecord?.toolName) ??
-        safeString(metadataRecord?.tool_name),
+        safeString(metadataRecord?.tool_name) ??
+        topLevelToolName,
       toolInput:
         metadataRecord?.input !== undefined
           ? toJson(metadataRecord.input)
@@ -374,6 +388,9 @@ function buildMessageParts(params: {
             : (safeString(metadataRecord?.tool_output) ?? null),
       metadata: toJson({
         originalRole: role,
+        toolCallId: topLevelToolCallId,
+        toolName: topLevelToolName,
+        isError: topLevelIsError,
         rawType: block.type,
         raw: metadataRecord ?? message.content[ordinal],
       }),
@@ -569,6 +586,12 @@ export class LcmContextEngine implements ContextEngine {
   };
 
   private config: LcmConfig;
+
+  /** Get the configured timezone, falling back to system timezone. */
+  get timezone(): string {
+    return this.config.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  }
+
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
   private assembler: ContextAssembler;
@@ -1535,6 +1558,10 @@ export class LcmContextEngine implements ContextEngine {
         observedTokens !== undefined
           ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
           : await this.compaction.evaluate(conversationId, tokenBudget);
+      const targetTokens =
+        params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+      const liveContextStillExceedsTarget =
+        observedTokens !== undefined && observedTokens >= targetTokens;
 
       if (!forceCompaction && !decision.shouldCompact) {
         return {
@@ -1559,27 +1586,28 @@ export class LcmContextEngine implements ContextEngine {
         });
 
         return {
-          ok: true,
+          ok: sweepResult.actionTaken || !liveContextStillExceedsTarget,
           compacted: sweepResult.actionTaken,
           reason: sweepResult.actionTaken
             ? "compacted"
             : manualCompactionRequested
               ? "nothing to compact"
-              : "already under target",
+              : liveContextStillExceedsTarget
+                ? "live context still exceeds target"
+                : "already under target",
           result: {
             tokensBefore: decision.currentTokens,
             tokensAfter: sweepResult.tokensAfter,
             details: {
               rounds: sweepResult.actionTaken ? 1 : 0,
-              targetTokens:
-                params.compactionTarget === "threshold" ? decision.threshold : tokenBudget,
+              targetTokens,
             },
           },
         };
       }
 
       // When forced, use the token budget as target
-      const targetTokens = forceCompaction
+      const convergenceTargetTokens = forceCompaction
         ? tokenBudget
         : params.compactionTarget === "threshold"
           ? decision.threshold
@@ -1588,7 +1616,7 @@ export class LcmContextEngine implements ContextEngine {
       const compactResult = await this.compaction.compactUntilUnder({
         conversationId,
         tokenBudget,
-        targetTokens,
+        targetTokens: convergenceTargetTokens,
         ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
         summarize,
       });
@@ -1607,7 +1635,7 @@ export class LcmContextEngine implements ContextEngine {
           tokensAfter: compactResult.finalTokens,
           details: {
             rounds: compactResult.rounds,
-            targetTokens,
+            targetTokens: convergenceTargetTokens,
           },
         },
       };
