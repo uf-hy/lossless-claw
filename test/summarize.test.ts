@@ -218,7 +218,23 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       },
     });
 
-    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", undefined);
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "anthropic");
+    expect(vi.mocked(deps.log.warn)).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
+  });
+
+  it("env summaryModel without summaryProvider falls back to the legacy provider hint", async () => {
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openai-resp",
+        model: "gpt-5.4",
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "openai-resp");
     expect(vi.mocked(deps.log.warn)).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
   });
 

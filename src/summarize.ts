@@ -716,7 +716,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
   const resolveProviderHint =
     resolvedSummary !== undefined
-      ? resolvedSummary.provider
+      ? (
+          resolvedSummary.provider ||
+          (!resolvedSummary.model.includes("/") ? (providerHint || undefined) : undefined)
+        )
       : (providerHint || undefined);
 
   let resolved: { provider: string; model: string };
