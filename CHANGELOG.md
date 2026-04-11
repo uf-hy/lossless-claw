@@ -1,5 +1,15 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.0
+
+### Minor Changes
+
+- [#355](https://github.com/Martian-Engineering/lossless-claw/pull/355) [`6e9388c`](https://github.com/Martian-Engineering/lossless-claw/commit/6e9388c17036caa6021ab075e4d91ee928d73986) Thanks [@LanicBlue](https://github.com/LanicBlue)! - Externalize inline base64 images before large tool-result text compaction, and add `largeFilesDir` / `LCM_LARGE_FILES_DIR` so externalized payload storage can be configured explicitly.
+
+### Patch Changes
+
+- [#403](https://github.com/Martian-Engineering/lossless-claw/pull/403) [`ea7d532`](https://github.com/Martian-Engineering/lossless-claw/commit/ea7d5327d648790350724c15990b5c1ab98bf611) Thanks [@jetd1](https://github.com/jetd1)! - Convert bootstrap's file I/O off the Node.js event loop. `readFileSegment` and `readLastJsonlEntryBeforeOffset` previously used sync `openSync`/`readSync`/`statSync`, which could block the gateway for minutes while scanning multi-MB JSONL transcripts during the bootstrap append-only path. The bootstrap entry `statSync` and `refreshBootstrapState` helper are now async as well. The backward-scan loop now only reads new chunks when the current carry has no more newlines, and the fast path short-circuits before the backward scan when the DB's latest hash no longer matches the checkpoint (the common case during active sessions, where the scan can never succeed).
+
 ## 0.8.2
 
 ### Patch Changes
